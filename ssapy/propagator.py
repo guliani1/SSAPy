@@ -192,91 +192,117 @@ class SGP4Propagator(Propagator):
     Parameters
     ----------
     t : float or astropy.time.Time, optional
-        Reference time at which to compute frame transformation between GCRF
-        and TEME.  SGP4 calculations occur in the TEME frame, but useful input
-        and output is in the GCRF frame.  In principle, one could do the
-        transformation at every instant in time for which the orbit is queried.
-        However, the rate of change in the transformation is small, ~0.15 arcsec
-        per day, so here we just use a single transformation.
-
-        If float, then should correspond to GPS seconds;
-        i.e., seconds since 1980-01-06 00:00:00 UTC
-
-        If None, then use the time of the orbit being propagated.
+        Reference time for TEME->GCRF rotation. If None, use orbit.t.
     truncate : bool, optional
-        Truncate elements to precision of TLE ASCII format?  This may be
-        required in order to reproduce the results of running sgp4 directly from
-        a TLE.
+        If True, synthesize a TLE from the orbit elements and use twoline2rv.
+    line1, line2 : str, optional
+        Real TLE lines to initialize Satrec.
+    satrec : sgp4.api.Satrec, optional
+        Prebuilt Satrec object to use directly.
     """
-    def __init__(self, t=None, truncate=False):
+    def __init__(self, t=None, truncate=False, line1=None, line2=None, satrec=None):
+        from astropy.time import Time
         if isinstance(t, Time):
             t = t.gps
         self.t = t
         self.truncate = truncate
+        self._line1 = line1
+        self._line2 = line2
+        self._satrec = satrec
 
     def __repr__(self):
         return "SGP4Propagator()"
 
     def _getRVOne(self, orbit, time):
+        import numpy as np
+        from astropy.time import Time
         from sgp4.api import Satrec, WGS72
         from .orbit import _ellipticalEccentricToMeanAnomaly, _ellipticalTrueToEccentricAnomaly
         from .constants import WGS72_EARTH_MU
         from .io import make_tle
+        from .frames import teme_to_gcrf  # adjust import to your project
 
-        if self.truncate:
+        # Resolve Satrec source and whether it is TLE-backed
+        from_tle = False
+        if self._satrec is not None:
+            sat = self._satrec
+            from_tle = True
+        elif isinstance(self._line1, str) and isinstance(self._line2, str):
+            sat = Satrec.twoline2rv(self._line1, self._line2)
+            from_tle = True
+        elif self.truncate:
             line1, line2 = make_tle(*orbit.kozaiMeanKeplerianElements, orbit.t)
             sat = Satrec.twoline2rv(line1, line2)
+            from_tle = True
         else:
+            # Direct element-based init
             a, e, i, pa, raan, trueAnomaly = orbit.kozaiMeanKeplerianElements
             meanAnomaly = _ellipticalEccentricToMeanAnomaly(
-                _ellipticalTrueToEccentricAnomaly(
-                    trueAnomaly % (2 * np.pi), e
-                ),
+                _ellipticalTrueToEccentricAnomaly(trueAnomaly % (2 * np.pi), e),
                 e
             )
-            meanMotion = np.sqrt(WGS72_EARTH_MU / np.abs(a**3)) * 60.0  # rad/m
+            meanMotion = np.sqrt(WGS72_EARTH_MU / np.abs(a**3)) * 60.0  # rad/min
             tt = Time(orbit.t, format='gps').utc
-            epoch = tt.mjd - 33281.0
+            epoch = tt.mjd - 33281.0  # days since 1949-12-31 00:00 UT
+
             sat = Satrec()
             sat.sgp4init(
-                WGS72,        # gravity model
-                'i',          # 'a' = old AFSPC mode, 'i' = improved mode
-                0,            # satnum: Satellite number
-                epoch,        # epoch: days since 1949 December 31 00:00 UT
-                0.0,          # bstar: drag coefficient (kg/m2er)
-                0.0,          # ndot: ballistic coefficient (revs/day)
-                0.0,          # nddot: second derivative of mean motion (revs/day^3)
-                e,            # ecco: eccentricity
-                pa,           # argpo: argument of perigee (radians)
-                i,            # inclo: inclination (radians)
-                meanAnomaly,  # mo: mean anomaly (radians)
-                meanMotion,   # no_kozai: mean motion (radians/minute)
-                raan,         # nodeo: right ascension of ascending node (radians)
+                WGS72, 'i', 0, epoch,
+                0.0, 0.0, 0.0,     # bstar, ndot, nddot
+                e, pa, i,          # ecco, argpo, inclo
+                meanAnomaly,       # mo
+                meanMotion,        # no_kozai
+                raan               # nodeo
             )
 
-        rs, vs = [], []
-        for t in time:
-            e, r, v = sat.sgp4_tsince((t - orbit.t) / 60.0)
-            rs.append(r)
-            vs.append(v)
-        rs = np.array(rs)
-        vs = np.array(vs)
+        # Precompute rotation once at reference time
         tref = self.t if self.t is not None else orbit.t
         rot = teme_to_gcrf(tref)
+
+        # If TLE-backed, get its UTC epoch for dt
+        tle_epoch_utc = None
+        if from_tle:
+            tle_epoch_utc = Time(sat.jdsatepoch + sat.jdsatepochF, format="jd", scale="utc")
+
+        rs_km, vs_km_s = [], []
+        for t_gps in time:
+            if from_tle:
+                dt_min = (Time(t_gps, format="gps").utc - tle_epoch_utc).to_value("min")
+            else:
+                dt_min = (t_gps - orbit.t) / 60.0
+
+            ecode, r_km, v_km_s = sat.sgp4_tsince(float(dt_min))
+            if ecode != 0:
+                raise RuntimeError(f"SGP4 error code {ecode} at dt={dt_min:.6f} min")
+            rs_km.append(r_km)
+            vs_km_s.append(v_km_s)
+
+        rs = np.array(rs_km, dtype=float)
+        vs = np.array(vs_km_s, dtype=float)
+
+        # TEME -> GCRF at fixed reference time
         rs = np.dot(rot, rs.T).T
         vs = np.dot(rot, vs.T).T
-        rs *= 1e3  # km -> m
-        vs *= 1e3  # km/s -> m/s
+
+        # km to m, km/s to m/s
+        rs *= 1e3
+        vs *= 1e3
         return rs, vs
 
     def __hash__(self):
+        from astropy.time import Time
         t = self.t.gps if isinstance(self.t, Time) else self.t
-        return hash(("SGP4Propagator", t))
+        return hash(("SGP4Propagator", t, self.truncate, self._line1, self._line2,
+                     id(self._satrec) if self._satrec is not None else None))
 
     def __eq__(self, rhs):
         if not isinstance(rhs, SGP4Propagator):
             return False
-        return np.all(self.t == rhs.t)
+        return (self.t == rhs.t and
+                self.truncate == rhs.truncate and
+                self._line1 == rhs._line1 and
+                self._line2 == rhs._line2 and
+                self._satrec is rhs._satrec)
 
 
 def impact_event(t, s):
